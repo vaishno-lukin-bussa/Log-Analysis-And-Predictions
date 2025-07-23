@@ -1,7 +1,7 @@
 from keras.models import Sequential
 from keras.layers import LSTM, Dense, Dropout
 from keras import Input
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
@@ -38,47 +38,64 @@ monthly_errors = df.groupby(["month", "message"]).size().reset_index(name="count
 pivoted = monthly_errors.pivot(index="month", columns="message", values="count").fillna(0)
 
 # --- 4. LSTM training ---
-def create_sequences(data, seq_len=3):
-    X, y = [], []
-    for i in range(len(data) - seq_len):
-        X.append(data[i:i+seq_len])
-        y.append(data[i + seq_len])
-    return np.array(X), np.array(y)
+def train_lstm_forecast_multivariate(pivoted_df, months=7, window=3):
+    if pivoted_df.shape[0] <= window:
+        return pd.DataFrame(np.zeros((months, pivoted_df.shape[1])), columns=pivoted_df.columns)
 
-def train_lstm_forecast(series, months=7, seq_len=3):
-    if len(series) < seq_len + 2:
-        return [series.mean()] * months
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(pivoted_df.values)
 
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(series.values.reshape(-1, 1))
+    def create_sequences(data, window):
+        X, y = [], []
+        for i in range(len(data) - window):
+            X.append(data[i:i+window])
+            y.append(data[i+window])
+        return np.array(X), np.array(y)
 
-    X, y = create_sequences(scaled, seq_len)
-    X = X.reshape(-1, seq_len, 1)
+    X, y = create_sequences(scaled_data, window)
+    X = X.reshape((X.shape[0], X.shape[1], X.shape[2]))
 
     model = Sequential([
-        Input(shape=(seq_len, 1)),
+        Input(shape=(X.shape[1], X.shape[2])),
         LSTM(64, return_sequences=True),
-        Dropout(0.2),
+        Dropout(0.4),
+        LSTM(64, return_sequences=True),
+        Dropout(0.3),
         LSTM(32),
-        Dense(1)
+        Dropout(0.2),
+        Dense(y.shape[1])
     ])
-    model.compile(optimizer="adam", loss="mse")
-    model.fit(X, y, epochs=140, verbose=0)
 
-    forecasts = []
-    input_seq = scaled[-seq_len:].reshape(1, seq_len, 1)
-    for _ in range(months):
-        pred = model.predict(input_seq, verbose=0)
-        forecasts.append(pred[0][0])
-        input_seq = np.concatenate((input_seq[:, 1:, :], pred.reshape(1, 1, 1)), axis=1)
+    model.compile(optimizer='adam', loss='mse')
+    model.fit(X, y, epochs=100, batch_size=8, verbose=0)
 
+    def forecast_next(data, steps=months):
+        output = []
+        current = data[-window:].copy()
+        for _ in range(steps):
+            x = current.reshape((1, current.shape[0], current.shape[1]))
+            y_pred = model.predict(x, verbose=0)[0]
+            noise = np.random.normal(0, 0.05, size=y_pred.shape)
+            y_pred = y_pred + noise
+            output.append(y_pred)
+            current = np.vstack([current[1:], [y_pred]])
+        return np.array(output)
 
-    return scaler.inverse_transform(np.array(forecasts).reshape(-1, 1)).flatten()
+    forecast_scaled = forecast_next(scaled_data, months)
+    forecast = scaler.inverse_transform(forecast_scaled)
+    forecast_df = pd.DataFrame(forecast, columns=pivoted_df.columns)
 
-# --- 5. Forecast each error ---
-forecast_results = {}
-for col in pivoted.columns:
-    forecast_results[col] = train_lstm_forecast(pivoted[col])
+    max_vals = pivoted_df.max().values
+    forecast_df = forecast_df.clip(lower=0, upper=max_vals)
+
+    for col in forecast_df.columns:
+        if pivoted_df[col].sum() == 1:
+            forecast_df[col] = 0
+
+    return forecast_df
+
+# --- 5. Forecast using new model ---
+forecast_df = train_lstm_forecast_multivariate(pivoted)
 
 # --- 6. FastAPI setup ---
 app = FastAPI()
@@ -100,11 +117,11 @@ def serve_combined_forecast():
     future_months = pd.date_range("2025-06-01", periods=7, freq="MS")
     forecast_rows = []
     for i, month in enumerate(future_months):
-        for error_type, preds in forecast_results.items():
+        for error_type in forecast_df.columns:
             forecast_rows.append({
                 "timestamp": month.strftime("%Y-%m-%dT%H:%M:%S"),
                 "error_type": error_type,
-                "count": int(preds[i]),
+                "count": int(forecast_df.iloc[i][error_type]),
                 "type": "forecast"
             })
 
